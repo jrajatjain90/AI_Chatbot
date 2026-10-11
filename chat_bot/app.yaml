@@ -1,0 +1,4 @@
+command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+env:
+  - name: WAREHOUSE_ID
+    value: "da19d04f9077024b"
