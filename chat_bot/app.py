@@ -35,7 +35,8 @@ def run_query(query):
             cursor.execute(query)
             rows = cursor.fetchall()
             cols = [c[0] for c in cursor.description]
-    df = pd.DataFrame(rows, columns=cols)
+
+    df = pd.DataFrame(rows, columns=cols)   
     for c in df.columns:
         if df[c].map(lambda v: isinstance(v, Decimal)).any():
             df[c] = df[c].astype(float)
@@ -179,9 +180,24 @@ def ask_sql(question, max_retries=2):
             if attempt == max_retries:
                 return q, f"FAILED: {e}"
             q = fix_sql(question, q, str(e)[:500])
-
-def explain_Sql(question,result):
+def explain_Sql(question,result,max_retries=2):
+    NO_METRICS_NOTE = (
+    "No precomputed metrics are available for this result. "
+    "Use only values that appear in the query results. "
+    "Do not calculate percentages or changes. "
+    "If the data is insufficient, say so in trend_summary."
+)
     metrics,largest_increase,largest_decrease=calculate_revenue_metrics(result)
+    user_message = f"user question: {question}\nQuery results: {json.dumps(result, default=str)}\n"
+    if metrics is None:
+        user_message+=NO_METRICS_NOTE
+    else:
+        user_message += (
+        f"calculated metrics: {json.dumps(metrics)}\n"
+        f"largest_increase: {json.dumps(largest_increase)}\n"
+        f"largest_decrease: {json.dumps(largest_decrease)}\n"
+        "Use the calculated metrics as the source of truth."
+    )
    
     build = """
             You are an expert business data analyst for a business intelligence chatbot.
@@ -208,7 +224,7 @@ def explain_Sql(question,result):
 
             Rules:
             1. Use only the supplied SQL results and calculated metrics.
-            2. Treat Python-calculated metrics as the source of truth.
+            2. Treat Python-calculated metrics as the source of truth when they are supplied.
             3. Do not recalculate, modify, round differently, or contradict
             any supplied calculated metric.
             4. Preserve the exact values, region names, and periods from
@@ -225,37 +241,29 @@ def explain_Sql(question,result):
             12. All JSON strings must use double quotes.
             13. Do not include trailing commas.
             14. Return valid JSON only.
-"""
+            15. Do not add currency symbols unless they appear in the supplied data.
+        """
 
-
-
-
-    user_message=(
-      f"user question:{question}\n"
-      f"Query results: {json.dumps(result, default=str)}\n"
-      f"calculated metrics:{metrics}\n"
-      f"largest_increase:{largest_increase}\n"
-      f"largest_decrease:{largest_decrease}\n"
-      "Use the calculated metric as source of truth"
-      )
-    
-    resp=ask_llm(
-        build,
-        user_message
-    )
-    try:
-        return json.loads(resp)
-    except json.JSONDecodeError as exc:
-        raise ValueError("The LLM returned invalid json for the insights response") from exc
+    last_err=None
+    for attempt in range(max_retries+1):
+        resp=ask_llm(build,user_message)
+        try:
+            return validate_inisights(extract_json(resp))
+        except(json.JSONDecodeError, ValueError) as e:
+            last_err=e
+            print(f"[attempt {attempt}] bad LLM output:\n{resp}\n")
+    raise ValueError("The LLM returned invalid json for the insights response") from last_err
 
 def calculate_revenue_metrics(results):
+    if not isinstance(results, list) or not results:
+        return None, None, None
+    if not {"sale_month", "region", "revenue"} <= set(results[0].keys()):
+        return None, None, None
+    
     monthly_region = defaultdict(dict)
 
     for row in results:
-        month = row["sale_month"]
-        region = row["region"]
-        revenue = float(row["revenue"])
-        monthly_region[region][month] = revenue
+        monthly_region[row["region"]][row["sale_month"]] = float(row["revenue"])
 
     metrics = {
         "region_averages": {},
@@ -264,40 +272,47 @@ def calculate_revenue_metrics(results):
 
     for region, months in monthly_region.items():
         ordered = sorted(months.items())
-
         metrics["region_averages"][region] = round(
             sum(value for _, value in ordered) / len(ordered), 2
         )
 
-        for i in range(1, len(ordered)):
-            previous_month, previous_value = ordered[i - 1]
-            current_month, current_value = ordered[i]
-
-            if previous_value != 0:
-                change_pct = (
-                    (current_value - previous_value)
-                    / previous_value
-                ) * 100
-
+        for (pm,pv),(cm,cv) in zip(ordered,ordered[1:]):
+            if pv!=0:
                 metrics["monthly_changes"].append({
                     "region": region,
-                    "from_month": previous_month,
-                    "to_month": current_month,
-                    "change_pct": round(change_pct, 2)
+                    "from_month": pm,
+                    "to_month": cm,
+                    "change_pct": round((cv - pv) / pv * 100, 2),
                 })
-    changes= metrics['monthly_changes']                    
-    largest_increase=max(
-        changes, key=lambda x:x['change_pct']        
-    )
 
-    largest_decrease= min(
-        changes, key=lambda x:x['change_pct']
-    )
+    changes= metrics['monthly_changes'] 
+    if not changes:
+        return metrics, None, None
+
+
+    largest_increase=max(changes, key=lambda x:x['change_pct'])
+    largest_decrease= min(changes, key=lambda x:x['change_pct'])
 
     return (metrics, largest_increase,largest_decrease)
 
+def extract_json(text:str)->dict:
+    text=text.strip()
+    text=re.sub(r"^```(?:json)?\s*|\s*```$", "", text)
+    start,end=text.find("{"), text.rfind("}")
+    if start==-1 or end==-1:
+        raise json.JSONDecodeError("No Json object Found",text,0 )
+    return json.loads(text[start:end+1])
 
+def validate_inisights(data:dict)->dict:
+    if set(data)!={"key_findings", "trend_summary", "recommendation"}:
+        raise ValueError("Unexpected top-level keys")
 
+    for f in data['key_findings']:
+        if set(f)!={"title","value","period","type","description"}:
+            raise ValueError("Bad finding type")
+        if f['type'] not in ("positive","negative","neutral"):
+            raise ValueError("Bad finding type")
+    return data
 
 # ---------- answer + chart ----------
 def summarize(question, df):
@@ -468,7 +483,7 @@ def export(req: ExportRequest):
     wb.save(buf)
     return Response(buf.getvalue(),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": 'attachment; filename="sales_export.xlsx"'})
+        headers={"Content-Disposition": 'attachment; filename="sales_export.xlsx"'}) 
 
 
 
